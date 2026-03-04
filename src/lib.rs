@@ -4,7 +4,7 @@ mod types;
 
 use anyhow::{Result, anyhow};
 use extism_pdk::*;
-use pdk::imports::notify_logging_message;
+use pdk::imports::{notify_logging_message, notify_resource_updated};
 use pdk::types::*;
 use schemars::schema_for;
 use serde_json::{Value, json};
@@ -120,6 +120,12 @@ fn fetch_defuddle_markdown(url: &str) -> CallToolResult {
 
     // Cache the result
     cache::put("defuddle", &url.to_string(), &result);
+
+    // Notify subscribers that this resource has been updated (fresh fetch, not from cache)
+    notify_resource_updated(ResourceUpdatedNotificationParam {
+        uri: url.to_string(),
+    })
+    .ok();
 
     result
 }

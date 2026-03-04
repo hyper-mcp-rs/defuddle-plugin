@@ -6,6 +6,7 @@ A [Hyper MCP](https://github.com/hyper-mcp-rs/hyper-mcp) plugin that converts we
 
 - **Tool:** `defuddle` — fetch any `http://` or `https://` URL and get back clean Markdown with YAML frontmatter
 - **Resource templates:** `https://{+url}` and `http://{+url}` — read any web page as a Markdown resource
+- **Resource subscription notifications:** fires `notify_resource_updated` on every fresh fetch so subscribed clients are informed when content changes
 - **Caching:** optional on-disk cache (identical to the [context7-plugin](https://github.com/hyper-mcp-rs/context7-plugin) cache) keyed by a hash of the URL
 - **Retry logic:** automatic retries with back-off on 429 / 5xx responses
 
@@ -14,10 +15,11 @@ A [Hyper MCP](https://github.com/hyper-mcp-rs/hyper-mcp) plugin that converts we
 The plugin delegates HTML-to-Markdown conversion to the [defuddle.md](https://defuddle.md) web service. For any URL you provide, the plugin:
 
 1. Validates that the scheme is `http` or `https`
-2. Checks the local cache (if enabled) for a previous result
+2. Checks the local cache (if enabled) for a previous result — if found, returns it immediately **without** firing a subscription notification
 3. Strips the scheme and appends the remainder to `https://defuddle.md/` — e.g. `https://example.com/page` becomes `https://defuddle.md/example.com/page`
-4. Returns the Markdown response (with YAML frontmatter containing title, source URL, word count, etc.)
-5. Caches the result for future requests
+4. Caches the result for future requests
+5. Fires a `notify_resource_updated` notification with the URL as the resource URI, informing any subscribed clients that fresh content is available
+6. Returns the Markdown response (with YAML frontmatter containing title, source URL, word count, etc.)
 
 ## Configuration
 
@@ -169,7 +171,8 @@ efficiently and generically.
 
 - Returns a `CallToolResult` with a single text content block containing the Markdown
 - If the URL scheme is not `http` or `https`, returns an error result
-- If the URL has been fetched before and the cache entry is fresh, the cached result is returned
+- If the URL has been fetched before and the cache entry is fresh, the cached result is returned — no subscription notification is fired
+- On a fresh fetch from defuddle.md, fires `notify_resource_updated` with the URL as the resource URI (see [Resource Subscription Notifications](#resource-subscription-notifications))
 - Retries up to 3 times on 429 (rate limit) and 5xx (server error) responses, respecting the `Retry-After` header when present
 
 ### 2. `clear_cache`
@@ -223,9 +226,10 @@ When an MCP client resolves a resource URI like `https://en.wikipedia.org/wiki/R
 1. The client matches it against the `https://{+url}` template
 2. The full URI is passed to the plugin's `read_resource` handler
 3. The plugin validates the scheme, checks the cache, and calls defuddle.md
-4. The result is returned as a `TextResourceContents` with `mimeType: text/markdown`
+4. If the content was freshly fetched (not from cache), a `notify_resource_updated` notification is fired with the URI
+5. The result is returned as a `TextResourceContents` with `mimeType: text/markdown`
 
-The `read_resource` implementation shares the same validation, fetching, and caching logic as the `defuddle` tool — the only difference is the return type (`ReadResourceResult` with `TextResourceContents` instead of `CallToolResult`).
+The `read_resource` implementation shares the same validation, fetching, and caching logic as the `defuddle` tool — the only difference is the return type (`ReadResourceResult` with `TextResourceContents` instead of `CallToolResult`). Both paths go through the same `fetch_defuddle_markdown` function, so subscription notifications are fired identically regardless of whether the content was requested via the tool or via a resource read.
 
 ### Example
 
@@ -242,6 +246,32 @@ A client reading `https://example.com` as a resource receives:
   ]
 }
 ```
+
+## Resource Subscription Notifications
+
+The plugin fires [`notify_resource_updated`](https://spec.modelcontextprotocol.io/specification/2025-03-26/server/resources/#subscriptions) whenever it fetches **fresh** content from defuddle.md. This allows MCP clients that have subscribed to a resource URI to be informed that new content is available.
+
+**When notifications fire:**
+
+- Every time defuddle.md is called and returns a successful response — whether triggered by the `defuddle` tool or by `read_resource`
+
+**When notifications do NOT fire:**
+
+- Cache hits — if the result is served from the local cache, no notification is sent
+- Errors — if the fetch fails (network error, non-2xx status), no notification is sent
+- Validation failures — if the URL scheme is rejected, no notification is sent
+
+**Notification payload:**
+
+The notification carries a `ResourceUpdatedNotificationParam` with the original URL as the `uri` field:
+
+```json
+{
+  "uri": "https://example.com/page"
+}
+```
+
+> **Note:** The plugin does not check whether the content has actually changed compared to a previous fetch. A notification is fired on every fresh (non-cached) successful response. Clients that need to detect actual content changes should compare the new content against their own prior copy.
 
 ## API Endpoint
 
