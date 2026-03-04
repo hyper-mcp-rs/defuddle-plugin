@@ -36,8 +36,14 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
-      - name: Run tests
-        run: cargo test --test resolve_library_id_tests
+      - name: Run URL validation tests
+        run: cargo test --test url_validation_tests
+
+      - name: Run cache tests
+        run: cargo test --test cache_tests
+
+      - name: Run API integration tests
+        run: cargo test --test defuddle_api_tests
 
   build:
     name: Build
