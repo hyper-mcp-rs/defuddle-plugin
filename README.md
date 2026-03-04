@@ -1,392 +1,398 @@
-# Rust Plugin Template
+# Defuddle Plugin
 
-A WebAssembly plugin template for building MCP (Model Context Protocol) plugins in Rust using the hyper-mcp framework.
+A [Hyper MCP](https://github.com/hyper-mcp-rs/hyper-mcp) plugin that converts web pages to clean, readable Markdown using [defuddle.md](https://defuddle.md). It exposes both an MCP tool and MCP resource templates, so AI assistants can fetch and read any web page as Markdown.
 
-## Overview
+## Features
 
-This template provides a starter project for creating MCP plugins that run as WebAssembly modules. It includes all necessary dependencies and boilerplate code to implement MCP protocol handlers.
+- **Tool:** `defuddle` — fetch any `http://` or `https://` URL and get back clean Markdown with YAML frontmatter
+- **Resource templates:** `https://{+url}` and `http://{+url}` — read any web page as a Markdown resource
+- **Caching:** optional on-disk cache (identical to the [context7-plugin](https://github.com/hyper-mcp-rs/context7-plugin) cache) keyed by a hash of the URL
+- **Retry logic:** automatic retries with back-off on 429 / 5xx responses
+
+## How It Works
+
+The plugin delegates HTML-to-Markdown conversion to the [defuddle.md](https://defuddle.md) web service. For any URL you provide, the plugin:
+
+1. Validates that the scheme is `http` or `https`
+2. Checks the local cache (if enabled) for a previous result
+3. Strips the scheme and appends the remainder to `https://defuddle.md/` — e.g. `https://example.com/page` becomes `https://defuddle.md/example.com/page`
+4. Returns the Markdown response (with YAML frontmatter containing title, source URL, word count, etc.)
+5. Caches the result for future requests
+
+## Configuration
+
+### Minimal
+
+```json
+{
+  "plugins": {
+    "defuddle": {
+      "url": "oci://ghcr.io/hyper-mcp-rs/defuddle-plugin:latest",
+      "runtime_config": {
+        "allowed_hosts": ["defuddle.md"]
+      }
+    }
+  }
+}
+```
+
+For nightly builds:
+
+```json
+{
+  "plugins": {
+    "defuddle": {
+      "url": "oci://ghcr.io/hyper-mcp-rs/defuddle-plugin:nightly",
+      "runtime_config": {
+        "allowed_hosts": ["defuddle.md"]
+      }
+    }
+  }
+}
+```
+
+### With Caching
+
+Add `/cache` to `allowed_paths`, mapping it to a directory on the host:
+
+```json
+{
+  "plugins": {
+    "defuddle": {
+      "url": "oci://ghcr.io/hyper-mcp-rs/defuddle-plugin:latest",
+      "runtime_config": {
+        "allowed_hosts": ["defuddle.md"],
+        "allowed_paths": ["/path/on/host/defuddle-cache:/cache"]
+      }
+    }
+  }
+}
+```
+
+If the `/cache` directory is not mounted the plugin will log an info-level message and operate without caching:
+
+```
+Cache directory /cache is not mounted; caching is disabled
+```
+
+### Cache TTL
+
+By default cached responses expire after **1 day**. Customize this with the `CACHE_TTL` environment variable (value is in days):
+
+```json
+{
+  "plugins": {
+    "defuddle": {
+      "url": "oci://ghcr.io/hyper-mcp-rs/defuddle-plugin:latest",
+      "runtime_config": {
+        "allowed_hosts": ["defuddle.md"],
+        "allowed_paths": ["/path/on/host/defuddle-cache:/cache"],
+        "env_vars": {
+          "CACHE_TTL": "7"
+        }
+      }
+    }
+  }
+}
+```
+
+### Full Configuration Example
+
+```json
+{
+  "plugins": {
+    "defuddle": {
+      "url": "oci://ghcr.io/hyper-mcp-rs/defuddle-plugin:latest",
+      "runtime_config": {
+        "allowed_hosts": ["defuddle.md"],
+        "allowed_paths": ["/path/on/host/defuddle-cache:/cache"],
+        "env_vars": {
+          "CACHE_TTL": "3"
+        }
+      }
+    }
+  }
+}
+```
+
+### How the Cache Works
+
+- Entries are stored as JSON files in `/cache`, named `defuddle_{hex_hash}.json` where the hash is derived from the URL string.
+- Staleness is determined by comparing the file's last-modified time against the configured TTL.
+- Only successful responses are cached; errors are never cached.
+- The `clear_cache` tool can be used to manually invalidate all cached entries.
+- Non-JSON files in the cache directory are left untouched by `clear_cache`.
+
+## Tools
+
+### 1. `defuddle`
+
+Fetches a URL and returns the page content as Markdown.
+
+Uses the [defuddle.md](https://defuddle.md) service to extract the main content from the page, strip away clutter (sidebars, headers, footers, ads, etc.), and convert the result to clean Markdown with YAML frontmatter.
+
+**Input Schema:**
+
+```json
+{
+  "url": "string (required) — The URL to fetch. Must use the http:// or https:// scheme."
+}
+```
+
+**Example Input:**
+
+```json
+{
+  "url": "https://docs.rs/serde/latest/serde/"
+}
+```
+
+**Example Output:**
+
+```markdown
+---
+title: "serde - Rust"
+source: "https://docs.rs/serde/latest/serde/"
+domain: "docs.rs"
+word_count: 542
+---
+
+# Serde
+
+Serde is a framework for **ser**ializing and **de**serializing Rust data structures
+efficiently and generically.
+
+...
+```
+
+**Behavior:**
+
+- Returns a `CallToolResult` with a single text content block containing the Markdown
+- If the URL scheme is not `http` or `https`, returns an error result
+- If the URL has been fetched before and the cache entry is fresh, the cached result is returned
+- Retries up to 3 times on 429 (rate limit) and 5xx (server error) responses, respecting the `Retry-After` header when present
+
+### 2. `clear_cache`
+
+Clears the on-disk Markdown cache. Use this when cached results appear stale or outdated.
+
+This tool takes no arguments.
+
+**Example Output (success):**
+
+```
+Cache cleared successfully (12 entries removed)
+```
+
+**Example Output (cache not mounted):**
+
+```
+Cache is not enabled (directory not mounted)
+```
+
+## Resource Templates
+
+The plugin registers two [RFC 6570](https://www.rfc-editor.org/rfc/rfc6570) URI templates that allow MCP clients to read any web page as a Markdown resource.
+
+### `https://{+url}`
+
+Matches any HTTPS URL. The `{+url}` variable uses RFC 6570 **reserved expansion**, which allows reserved characters like `/`, `?`, `#`, and `&` to pass through without percent-encoding.
+
+| Property | Value |
+|---|---|
+| **Name** | `defuddle-https` |
+| **URI Template** | `https://{+url}` |
+| **MIME Type** | `text/markdown` |
+| **Description** | Fetch any https URL and return its content as Markdown via defuddle.md |
+
+### `http://{+url}`
+
+Matches any HTTP URL. Identical behavior to the HTTPS template.
+
+| Property | Value |
+|---|---|
+| **Name** | `defuddle-http` |
+| **URI Template** | `http://{+url}` |
+| **MIME Type** | `text/markdown` |
+| **Description** | Fetch any http URL and return its content as Markdown via defuddle.md |
+
+### How Resource Templates Work
+
+When an MCP client resolves a resource URI like `https://en.wikipedia.org/wiki/Rust_(programming_language)`:
+
+1. The client matches it against the `https://{+url}` template
+2. The full URI is passed to the plugin's `read_resource` handler
+3. The plugin validates the scheme, checks the cache, and calls defuddle.md
+4. The result is returned as a `TextResourceContents` with `mimeType: text/markdown`
+
+The `read_resource` implementation shares the same validation, fetching, and caching logic as the `defuddle` tool — the only difference is the return type (`ReadResourceResult` with `TextResourceContents` instead of `CallToolResult`).
+
+### Example
+
+A client reading `https://example.com` as a resource receives:
+
+```json
+{
+  "contents": [
+    {
+      "uri": "https://example.com",
+      "mimeType": "text/markdown",
+      "text": "---\ntitle: \"Example Domain\"\nsource: \"https://example.com\"\nword_count: 16\n---\n\nThis domain is for use in documentation examples without needing permission. Avoid use in operations.\n\n[Learn more](https://iana.org/domains/example)\n"
+    }
+  ]
+}
+```
+
+## API Endpoint
+
+The plugin uses the [defuddle.md](https://defuddle.md) web service:
+
+- **Base URL:** `https://defuddle.md`
+- **Usage:** `GET https://defuddle.md/{url_without_scheme}`
+- **Response:** `text/markdown` with YAML frontmatter
+
+For example, fetching `https://example.com/page` results in a request to `https://defuddle.md/example.com/page`.
+
+### YAML Frontmatter Fields
+
+The defuddle.md service returns Markdown with YAML frontmatter containing metadata extracted from the page:
+
+| Field | Type | Description |
+|---|---|---|
+| `title` | string | Page title |
+| `author` | string | Author (when available) |
+| `published` | string | Publication date (when available) |
+| `source` | string | Original URL |
+| `domain` | string | Domain name (when available) |
+| `description` | string | Page description / summary (when available) |
+| `word_count` | number | Word count of the extracted content |
+
+## Development
+
+### Building
+
+Build the WASM plugin:
+
+```bash
+cargo build --release --target wasm32-wasip1
+```
+
+The compiled plugin will be available at `target/wasm32-wasip1/release/plugin.wasm`.
+
+### Testing
+
+The plugin includes a comprehensive test suite with **132 tests** across three test files. Because this is a WASM project (compiled for `wasm32-wasip1`), the tests must be run with an explicit native target:
+
+```bash
+# Run all tests
+cargo test --target $(rustc -vV | grep host | cut -d' ' -f2)
+
+# With output visible
+cargo test --target $(rustc -vV | grep host | cut -d' ' -f2) -- --nocapture
+```
+
+Or run individual test suites:
+
+```bash
+# URL validation and scheme-stripping logic (64 tests, no network)
+cargo test --test url_validation_tests --target $(rustc -vV | grep host | cut -d' ' -f2)
+
+# Cache functionality (42 tests, no network)
+cargo test --test cache_tests --target $(rustc -vV | grep host | cut -d' ' -f2)
+
+# Live API integration tests (26 tests, requires network)
+cargo test --test defuddle_api_tests --target $(rustc -vV | grep host | cut -d' ' -f2)
+```
+
+Or specify your target explicitly:
+
+```bash
+cargo test --target aarch64-apple-darwin    # macOS ARM
+cargo test --target x86_64-apple-darwin     # macOS Intel
+cargo test --target x86_64-unknown-linux-gnu  # Linux
+```
+
+#### URL Validation Tests (`url_validation_tests`)
+
+Tests verify:
+
+- ✅ `http://` and `https://` URLs accepted (with paths, query strings, fragments, ports, userinfo, encoded characters, subdomains)
+- ✅ Non-HTTP schemes rejected (`ftp`, `file`, `ssh`, `data`, `javascript`, `mailto`, `ws`, `wss`)
+- ✅ Malformed input rejected (empty strings, bare hostnames, gibberish)
+- ✅ Error messages contain useful context (rejected scheme name, "Invalid URL" for unparseable input)
+- ✅ Scheme stripping preserves the rest of the URL exactly
+- ✅ Case sensitivity (only lowercase `http://` / `https://` are stripped)
+- ✅ API URL construction produces correct `https://defuddle.md/{path}` output
+- ✅ Real-world URLs (GitHub, Wikipedia, YouTube, docs.rs, localhost, IP addresses, Unicode domains)
+
+#### Cache Tests (`cache_tests`)
+
+Tests verify:
+
+- ✅ Hash determinism (same URL → same hash, different URLs → different hashes)
+- ✅ `http://` vs `https://` produce different cache keys
+- ✅ Cache key from `DefuddleArguments` matches plain `String` hash (as used in production)
+- ✅ Cache path format: `{tool_name}_{hex_hash}.json`
+- ✅ `CallToolResult` serialization round-trip (text, structured, error, Markdown with frontmatter)
+- ✅ Cache put/get: basic hit, Markdown preservation, overwrite, multi-URL storage
+- ✅ Cache misses: empty directory, different URL, different tool name
+- ✅ TTL / staleness: fresh entries returned, stale entries rejected, zero-TTL always stale
+- ✅ Cache clear: removes `.json` files only, leaves non-JSON files, supports put-after-clear
+- ✅ Corrupted files: garbage data, empty files, wrong JSON shape, truncated JSON — all handled gracefully
+
+#### API Integration Tests (`defuddle_api_tests`)
+
+Tests verify:
+
+- ✅ defuddle.md returns `text/markdown` content type
+- ✅ Response contains YAML frontmatter with `title` field
+- ✅ Real-world pages work (Wikipedia, GitHub, rust-lang.org)
+- ✅ Nonexistent domains handled gracefully
+- ✅ API response wraps into `CallToolResult` and survives JSON round-trip (for caching)
+- ✅ Full pipeline: validate → strip → build API URL → fetch
+- ✅ Sequential requests return identical content (idempotency)
+- ✅ Markdown output is clean (no raw HTML tags)
+- ✅ RFC 6570 resource template patterns capture URL components correctly
+
+See [tests/README.md](tests/README.md) for detailed test documentation.
+
+### Code Quality
+
+```bash
+# Check formatting
+cargo fmt -- --check
+
+# Run clippy
+cargo clippy -- -D warnings
+```
+
+### Continuous Integration
+
+The CI workflow runs on every push to `main` and on pull requests:
+
+1. **clippy** — lint checks with `-D warnings`
+2. **fmt** — formatting check
+3. **build** — `cargo build --release --target wasm32-wasip1`
 
 ## Project Structure
 
 ```
-.
-├── .github/workflows    # Example Github Actions workflows
-|-- src/
-│   ├── lib.rs           # Main plugin implementation
-│   └── pdk/             # Plugin Development Kit types and utilities
-├── Cargo.toml           # Rust dependencies and project metadata
-├── Dockerfile           # Simple dockerfile for deploying to WASM
-└── .cargo/              # Cargo configuration
+defuddle-plugin/
+├── src/
+│   ├── lib.rs          # Plugin entry points: call_tool, list_tools, list_resource_templates, read_resource
+│   ├── cache.rs        # On-disk cache (mirrors context7-plugin's cache module)
+│   ├── types.rs        # DefuddleArguments, ClearCacheArguments
+│   └── pdk/            # Auto-generated PDK bindings (types, imports, exports)
+├── tests/
+│   ├── url_validation_tests.rs   # URL validation + scheme stripping (64 tests)
+│   ├── cache_tests.rs            # Cache logic (42 tests)
+│   ├── defuddle_api_tests.rs     # Live API integration (26 tests)
+│   └── README.md                 # Test documentation
+├── Cargo.toml
+├── Dockerfile
+└── README.md
 ```
-
-## Getting Started
-
-### Prerequisites
-
-- Rust 1.88 or later
-- `wasm32-wasip1` target installed:
-  ```sh
-  rustup target add wasm32-wasip1
-  ```
-
-### Development
-
-1. **Clone or use this template** to start your plugin project
-
-2. **Implement plugin handlers** in `src/lib.rs`:
-
-   > **Note:** You only need to implement the handlers relevant to your plugin. For example, if your plugin only provides tools, implement only `list_tools()` and `call_tool()`. All other handlers have default implementations that work out of the box.
-
-   - `list_tools()` - Describe available tools
-   - `call_tool()` - Execute a tool
-   - `list_resources()` - List available resources
-   - `read_resource()` - Read resource contents
-   - `list_prompts()` - List available prompts
-   - `get_prompt()` - Get prompt details
-   - `complete()` - Provide auto-completion suggestions
-
-3. **Build locally** (requires WASM target):
-   ```sh
-   cargo build --release --target wasm32-wasip1
-   ```
-   The compiled WASM module will be at: `target/wasm32-wasip1/release/plugin.wasm`
-
-### Dependencies
-
-The template includes key dependencies:
-
-- **extism-pdk** - Plugin Development Kit for Extism
-- **serde/serde_json** - JSON serialization/deserialization
-- **anyhow** - Error handling
-- **base64** - Base64 encoding/decoding
-- **chrono** - Date/time handling
-
-## Plugin Handler Functions
-
-Your plugin can implement any combination of the following handlers. **Only implement the handlers your plugin needs** - the template provides sensible defaults for everything else:
-
-| Handler | Purpose | Required For |
-|---------|---------|--------------|
-| `list_tools()` | Declare available tools | Tool-providing plugins |
-| `call_tool()` | Execute a tool | Tool-providing plugins |
-| `list_resources()` | Declare available resources | Resource-providing plugins |
-| `list_resource_templates()` | Declare resource templates | Dynamic resource plugins |
-| `read_resource()` | Read resource contents | Resource-providing plugins |
-| `list_prompts()` | Declare available prompts | Prompt-providing plugins |
-| `get_prompt()` | Retrieve a specific prompt | Prompt-providing plugins |
-| `complete()` | Provide auto-completions | Plugins supporting completions |
-| `on_roots_list_changed()` | Handle root changes | Plugins reacting to root changes |
-
-**Example: Tools-only plugin**
-
-If your plugin only provides tools, you only need to implement:
-
-```rust
-pub(crate) fn list_tools(_input: ListToolsRequest) -> Result<ListToolsResult> {
-    // Return your tools
-}
-
-pub(crate) fn call_tool(input: CallToolRequest) -> Result<CallToolResult> {
-    // Execute the requested tool
-}
-```
-
-All other handlers will use their default implementations.
-
-## Host Functions
-
-Your plugin can call these host functions to interact with the client and MCP server. Import them from the `pdk` module:
-
-```rust
-use crate::pdk::imports::*;
-```
-
-### User Interaction
-
-**`create_elicitation(input: ElicitRequestParamWithTimeout) -> Result<ElicitResult>`**
-
-Request user input through the client's elicitation interface. Use this when your plugin needs user guidance, decisions, or confirmations during execution.
-
-```rust
-let result = create_elicitation(ElicitRequestParamWithTimeout {
-    request: ElicitRequestParam {
-        // Define what input you're requesting
-        ..Default::default()
-    },
-    timeout_ms: Some(30000), // 30 second timeout
-})?;
-```
-
-### Message Generation
-
-**`create_message(input: CreateMessageRequestParam) -> Result<CreateMessageResult>`**
-
-Request message creation through the client's sampling interface. Use this when your plugin needs intelligent text generation or analysis with AI assistance.
-
-```rust
-let result = create_message(CreateMessageRequestParam {
-    messages: vec![/* conversation history */],
-    model_preferences: Some(/* model preferences */),
-    system: Some("You are a helpful assistant".to_string()),
-    ..Default::default()
-})?;
-```
-
-### Resource Discovery
-
-**`list_roots() -> Result<ListRootsResult>`**
-
-List the client's root directories or resources. Use this to discover what root resources (typically file system roots) are available and understand the scope of resources your plugin can access.
-
-```rust
-let roots = list_roots()?;
-for root in roots.roots {
-    println!("Root: {} at {}", root.name, root.uri);
-}
-```
-
-### Logging
-
-**`notify_logging_message(input: LoggingMessageNotificationParam) -> Result<()>`**
-
-Send diagnostic, informational, warning, or error messages to the client. The client's logging level determines which messages are processed and displayed.
-
-```rust
-notify_logging_message(LoggingMessageNotificationParam {
-    level: "info".to_string(),
-    logger: Some("my_plugin".to_string()),
-    data: serde_json::json!({"message": "Processing started"}),
-})?;
-```
-
-### Progress Reporting
-
-**`notify_progress(input: ProgressNotificationParam) -> Result<()>`**
-
-Report progress during long-running operations. Allows clients to display progress bars or status information to users.
-
-```rust
-notify_progress(ProgressNotificationParam {
-    progress: 50,
-    total: Some(100),
-})?;
-```
-
-### List Change Notifications
-
-Notify the client when your plugin's available items change:
-
-**`notify_tool_list_changed() -> Result<()>`**
-- Call this when you add, remove, or modify available tools
-
-**`notify_resource_list_changed() -> Result<()>`**
-- Call this when you add, remove, or modify available resources
-
-**`notify_prompt_list_changed() -> Result<()>`**
-- Call this when you add, remove, or modify available prompts
-
-**`notify_resource_updated(input: ResourceUpdatedNotificationParam) -> Result<()>`**
-- Call this when you modify the contents of a specific resource
-
-```rust
-// When your plugin's tools change
-notify_tool_list_changed()?;
-
-// When a specific resource is updated
-notify_resource_updated(ResourceUpdatedNotificationParam {
-    uri: "resource://my-resource".to_string(),
-})?;
-```
-
-### Example: Interactive Tool with Progress
-
-```rust
-pub(crate) fn call_tool(input: CallToolRequest) -> Result<CallToolResult> {
-    match input.name.as_str() {
-        "long_task" => {
-            // Log start
-            notify_logging_message(LoggingMessageNotificationParam {
-                level: "info".to_string(),
-                data: serde_json::json!({"message": "Starting long task"}),
-                ..Default::default()
-            })?;
-
-            // Do work with progress updates
-            for i in 0..10 {
-                // ... do work ...
-                notify_progress(ProgressNotificationParam {
-                    progress: (i + 1) * 10,
-                    total: Some(100),
-                })?;
-            }
-
-            Ok(CallToolResult {
-                content: vec![Content {
-                    type_: "text".to_string(),
-                    text: Some("Task completed".to_string()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })
-        },
-        _ => Err(anyhow!("Unknown tool")),
-    }
-}
-```
-
-## Building for Distribution
-
-### Using Docker
-
-The included `Dockerfile` provides a simple build that packages your plugin into a container:
-
-```sh
-cargo auditable build --release --target wasm32-wasip1
-cp target/wasm32-wasip1/release/plugin.wasm plugin.wasm
-docker push your-registry/your-plugin-name
-```
-
-### Manual Build
-
-To build manually without Docker:
-
-```sh
-# Install dependencies
-rustup target add wasm32-wasip1
-cargo install cargo-auditable
-
-# Build
-cargo auditable build --release --target wasm32-wasip1
-
-# Result is at: target/wasm32-wasip1/release/plugin.wasm
-```
-
-## Implementation Guide
-
-### Creating a Tool
-
-Here's an example of implementing a simple tool:
-
-```rust
-pub(crate) fn list_tools(_input: ListToolsRequest) -> Result<ListToolsResult> {
-    Ok(ListToolsResult {
-        tools: vec![
-            Tool {
-                name: "greet".to_string(),
-                description: Some("Greet a person".to_string()),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "The person's name"
-                        }
-                    },
-                    "required": ["name"]
-                }),
-            },
-        ],
-        ..Default::default()
-    })
-}
-
-pub(crate) fn call_tool(input: CallToolRequest) -> Result<CallToolResult> {
-    match input.name.as_str() {
-        "greet" => {
-            let name = input.arguments
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("name argument required"))?;
-
-            Ok(CallToolResult {
-                content: vec![Content {
-                    type_: "text".to_string(),
-                    text: Some(format!("Hello, {}!", name)),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })
-        },
-        _ => Err(anyhow!("Unknown tool: {}", input.name)),
-    }
-}
-```
-
-### Creating a Resource
-
-Example of implementing a resource:
-
-```rust
-pub(crate) fn list_resources(_input: ListResourcesRequest) -> Result<ListResourcesResult> {
-    Ok(ListResourcesResult {
-        resources: vec![
-            ResourceDescription {
-                uri: "resource://example".to_string(),
-                name: Some("Example Resource".to_string()),
-                description: Some("An example resource".to_string()),
-                mime_type: Some("text/plain".to_string()),
-            },
-        ],
-        ..Default::default()
-    })
-}
-
-pub(crate) fn read_resource(input: ReadResourceRequest) -> Result<ReadResourceResult> {
-    match input.uri.as_str() {
-        "resource://example" => Ok(ReadResourceResult {
-            contents: vec![ResourceContents {
-                mime_type: Some("text/plain".to_string()),
-                text: Some("Resource content here".to_string()),
-                ..Default::default()
-            }],
-        }),
-        _ => Err(anyhow!("Unknown resource: {}", input.uri)),
-    }
-}
-```
-
-## Configuration in hyper-mcp
-
-After building and publishing your plugin, configure it in hyper-mcp:
-
-```json
-{
-  "plugins": {
-    "my_plugin": {
-      "url": "oci://your-registry/your-plugin-name:latest"
-    }
-  }
-}
-```
-
-For local development/testing:
-
-```json
-{
-  "plugins": {
-    "my_plugin": {
-      "url": "file:///path/to/target/wasm32-wasip1/release/plugin.wasm"
-    }
-  }
-}
-```
-
-## Testing
-
-To test your plugin locally:
-
-1. Build it: `cargo build --release --target wasm32-wasip1`
-2. Update hyper-mcp's config to point to `file://` URL
-3. Start hyper-mcp with `RUST_LOG=debug`
-4. Test through Claude Desktop, Cursor IDE, or another MCP client
-
-## Resources
-
-- [hyper-mcp Documentation](https://github.com/hyper-mcp-rs/hyper-mcp)
-- [MCP Protocol Specification](https://spec.modelcontextprotocol.io/)
-- [Extism Plugin Development Kit](https://docs.extism.org/docs/pdk)
-- [Example Plugins](https://github.com/search?q=topic%3Aplugins+org%3Ahyper-mcp-rs&type=repositories)
 
 ## License
 
-Same as hyper-mcp - Apache 2.0
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
