@@ -1,5 +1,5 @@
 [package]
-name = "plugin"
+name = "defuddle"
 version = "0.1.0"
 edition = "2024"
 
@@ -25,3 +25,9 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 
 [workspace]
+
+[package.metadata.release]
+publish = false
+push = true
+tag = true
+tag-name = "v{{version}}"
