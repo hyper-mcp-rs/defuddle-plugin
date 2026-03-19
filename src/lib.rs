@@ -4,12 +4,13 @@ mod types;
 
 use anyhow::{Result, anyhow};
 use extism_pdk::*;
-use pdk::imports::{notify_logging_message, notify_resource_updated};
-use pdk::types::*;
+use pdk::{
+    http::http_request_with_retry,
+    imports::{notify_logging_message, notify_resource_updated},
+    types::*,
+};
 use schemars::schema_for;
 use serde_json::{Value, json};
-use std::thread;
-use std::time::Duration;
 use types::*;
 
 const DEFUDDLE_API_BASE_URL: &str = "https://defuddle.md";
@@ -20,41 +21,6 @@ fn validate_url(url: &str) -> Result<url::Url, String> {
     match parsed.scheme() {
         "http" | "https" => Ok(parsed),
         other => Err(format!("URL scheme must be http or https, got '{other}'")),
-    }
-}
-
-fn http_request_with_retry(req: &HttpRequest) -> Result<HttpResponse> {
-    const MAX_HTTP_ATTEMPTS: u32 = 3;
-    const RETRY_DELAY: Duration = Duration::from_secs(5);
-
-    let mut attempt = 0;
-
-    loop {
-        attempt += 1;
-        match http::request::<()>(req, None) {
-            Ok(res) => {
-                let status = res.status_code();
-
-                if attempt < MAX_HTTP_ATTEMPTS && (status == 429 || status >= 500) {
-                    let delay = res
-                        .header("retry-after")
-                        .or_else(|| res.header("Retry-After"))
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_secs)
-                        .unwrap_or(RETRY_DELAY);
-                    thread::sleep(delay);
-                    continue;
-                }
-                break Ok(res);
-            }
-            Err(e) => {
-                if attempt < MAX_HTTP_ATTEMPTS {
-                    thread::sleep(RETRY_DELAY);
-                    continue;
-                }
-                break Err(e);
-            }
-        }
     }
 }
 
